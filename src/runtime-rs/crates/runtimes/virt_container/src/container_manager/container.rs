@@ -92,6 +92,8 @@ impl Container {
         let mut inner = self.inner.write().await;
         let toml_config = self.resource_manager.config().await;
         let config = &self.config;
+        // let shared_userns = is_user_namespace_enabled(&spec);
+        // let shared_netus = shared_userns;
         let sandbox_pidns = is_pid_namespace_enabled(&spec);
         amend_spec(&mut spec, toml_config.runtime.disable_guest_seccomp).context("amend spec")?;
 
@@ -549,6 +551,19 @@ fn is_pid_namespace_enabled(spec: &oci::Spec) -> bool {
     false
 }
 
+// is_user_namespace_enabled checks if User namespace for a container needs to be created or joined.
+// fn is_user_namespace_enabled(spec: &oci::Spec) -> bool {
+//     if let Some(linux) = spec.linux.as_ref() {
+//         for n in linux.namespaces.iter() {
+//             if n.r#type.as_str() == oci::USERNAMESPACE {
+//                 return true;
+//             }
+//         }
+//     }
+
+//     false
+// }
+
 #[cfg(test)]
 mod tests {
     use super::amend_spec;
@@ -596,6 +611,71 @@ mod tests {
                 namespaces: vec![
                     oci::LinuxNamespace {
                         r#type: "pid".to_string(),
+                        path: "".to_string(),
+                    },
+                    oci::LinuxNamespace {
+                        r#type: "network".to_string(),
+                        path: "".to_string(),
+                    },
+                ],
+                result: false,
+            },
+            TestData {
+                desc: "pid namespace is set",
+                namespaces: vec![
+                    oci::LinuxNamespace {
+                        r#type: "pid".to_string(),
+                        path: "/some/path".to_string(),
+                    },
+                    oci::LinuxNamespace {
+                        r#type: "network".to_string(),
+                        path: "".to_string(),
+                    },
+                ],
+                result: true,
+            },
+        ];
+
+        let mut spec = oci::Spec::default();
+
+        for (i, d) in tests.iter().enumerate() {
+            spec.linux = Some(oci::Linux {
+                namespaces: d.namespaces.clone(),
+                ..Default::default()
+            });
+
+            assert_eq!(
+                d.result,
+                is_pid_namespace_enabled(&spec),
+                "test[{}]: {:?}",
+                i,
+                d.desc
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_user_namespace_enabled() {
+        struct TestData<'a> {
+            desc: &'a str,
+            namespaces: Vec<oci::LinuxNamespace>,
+            result: bool,
+        }
+
+        let tests = &[
+            TestData {
+                desc: "no user namespace",
+                namespaces: vec![oci::LinuxNamespace {
+                    r#type: "network".to_string(),
+                    path: "".to_string(),
+                }],
+                result: false,
+            },
+            TestData {
+                desc: "empty user namespace path",
+                namespaces: vec![
+                    oci::LinuxNamespace {
+                        r#type: "user".to_string(),
                         path: "".to_string(),
                     },
                     oci::LinuxNamespace {

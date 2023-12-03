@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use kata_sys_util::validate;
 use kata_types::mount::Mount;
 use strum::Display;
+use containerd_shim_protos::shim::oci::Options;
 
 /// Request: request from shim
 /// Request and Response messages need to be paired
@@ -129,6 +130,7 @@ pub struct ContainerConfig {
     pub rootfs_mounts: Vec<Mount>,
     pub terminal: bool,
     pub options: Option<Vec<u8>>,
+    pub option: Option<Options>,
     pub stdin: Option<String>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,

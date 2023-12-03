@@ -39,6 +39,8 @@ pub(crate) async fn prepare_virtiofs(
     fs_type: &str,
     id: &str,
     root: &str,
+    uid_mappings: Vec<(u32, u32, u32)>,
+    gid_mappings: Vec<(u32, u32, u32)>,
 ) -> Result<()> {
     let host_ro_dest = utils::get_host_ro_shared_path(id);
     utils::ensure_dir_exist(&host_ro_dest)?;
@@ -58,6 +60,8 @@ pub(crate) async fn prepare_virtiofs(
             queue_size: 0,
             queue_num: 0,
             options: vec![],
+            uid_mappings,
+            gid_mappings,
         },
     };
     h.add_device(DeviceType::ShareFs(share_fs_device))

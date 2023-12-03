@@ -56,7 +56,7 @@ use crate::device::{add_devices, get_virtio_blk_pci_device_name, update_env_pci}
 use crate::linux_abi::*;
 use crate::metrics::get_metrics;
 use crate::mount::baremount;
-use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
+use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS, NSTYPEUSER, NSTYPENET};
 use crate::network::setup_guest_dns;
 use crate::pci;
 use crate::random;
@@ -1177,7 +1177,11 @@ impl agent_ttrpc::AgentService for AgentService {
                 load_kernel_module(m).map_ttrpc_err(same)?;
             }
 
-            s.setup_shared_namespaces().await.map_ttrpc_err(same)?;
+            if req.shared_userns{
+                s.setup_shared_namespaces_in_userns(req.shared_netns, req.uid_mappings, req.gid_mappings).await.map_ttrpc_err(same)?;
+            } else {
+                s.setup_shared_namespaces().await.map_ttrpc_err(same)?;
+            }
         }
 
         let m = add_storages(sl(), req.storages, &self.sandbox, None)
@@ -1637,6 +1641,14 @@ fn update_container_namespaces(
         }
         if namespace.r#type == NSTYPEUTS {
             namespace.path = sandbox.shared_utsns.path.clone();
+            continue;
+        }
+        if namespace.r#type == NSTYPEUSER && sandbox.shared_userns.is_some() {
+            namespace.path = sandbox.shared_userns.as_ref().unwrap().path.clone();
+            continue;
+        }
+        if namespace.r#type == NSTYPENET && sandbox.shared_userns.is_some() {
+            namespace.path = sandbox.shared_netns.as_ref().unwrap().path.clone();
             continue;
         }
     }

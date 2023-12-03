@@ -55,6 +55,9 @@ pub(crate) struct ShareVirtioFsStandalone {
 
 impl ShareVirtioFsStandalone {
     pub(crate) fn new(id: &str, config: &SharedFsInfo) -> Result<Self> {
+        if !config.virtio_fs_uid_mappings.is_empty() || !config.virtio_fs_gid_mappings.is_empty() {
+            return Err(anyhow!("The uid/gid mappings must be used with virtiofs-inline mode"));
+        }
         Ok(Self {
             inner: Arc::new(RwLock::new(ShareVirtioFsStandaloneInner::default())),
             config: ShareVirtioFsStandaloneConfig {
@@ -173,7 +176,7 @@ impl ShareFs for ShareVirtioFsStandalone {
     }
 
     async fn setup_device_before_start_vm(&self, h: &dyn Hypervisor) -> Result<()> {
-        prepare_virtiofs(h, VIRTIO_FS, &self.config.id, &h.get_jailer_root().await?)
+        prepare_virtiofs(h, VIRTIO_FS, &self.config.id, &h.get_jailer_root().await?, vec![], vec![])
             .await
             .context("prepare virtiofs")?;
         self.setup_virtiofsd(h).await.context("setup virtiofsd")?;

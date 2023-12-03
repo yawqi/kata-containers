@@ -66,12 +66,12 @@ pub(crate) fn share_to_guest(
 // 2. /run/kata-containers/shared/sandboxes/$sbx_id/rw/ is bind mounted readonly to /run/kata-containers/shared/sandboxes/$sbx_id/ro/, so guest cannot modify it
 //
 // 3. host-guest shared files/directories are mounted one-level under /run/kata-containers/shared/sandboxes/$sbx_id/rw/passthrough and thus present to guest at one level under run/kata-containers/shared/containers/passthrough.
-pub(crate) fn get_host_ro_shared_path(id: &str) -> PathBuf {
-    Path::new(KATA_HOST_SHARED_DIR).join(id).join("ro")
+pub(crate) fn get_host_ro_shared_path(sid: &str) -> PathBuf {
+    get_host_shared_path(sid).join("ro")
 }
 
 pub fn get_host_rw_shared_path(sid: &str) -> PathBuf {
-    Path::new(KATA_HOST_SHARED_DIR).join(sid).join("rw")
+    get_host_shared_path(sid).join("rw")
 }
 
 pub fn get_host_shared_path(sid: &str) -> PathBuf {

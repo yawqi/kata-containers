@@ -10,6 +10,9 @@ use super::{
 };
 use anyhow::{Context, Result};
 use containerd_shim_protos::api;
+use containerd_shim_protos::shim::oci::Options;
+use protobuf::CodedInputStream;
+use protobuf::Message;
 use kata_types::mount::Mount;
 use std::{
     convert::{From, TryFrom},
@@ -40,17 +43,51 @@ fn trans_from_shim_mount(from: &api::Mount) -> Mount {
 impl TryFrom<api::CreateTaskRequest> for Request {
     type Error = anyhow::Error;
     fn try_from(from: api::CreateTaskRequest) -> Result<Self> {
-        let options = if from.has_options() {
-            Some(from.options().value.to_vec())
+        let option = if from.has_options() {
+            let mut s = CodedInputStream::from_bytes(&from.options().value);
+            let mut my_opt = Options::new();
+            my_opt.merge_from(&mut s).unwrap();
+            Some(my_opt)
         } else {
             None
         };
+        // let (io_uid, io_gid) = if from.has_options() {
+        //     let opt: Options = from.options().into();
+            
+        //     let io_uid = if opt.io_uid != 0 {
+        //         Some(opt.io_uid)
+        //     } else {
+        //         None
+        //     };
+
+        //     let io_gid = if opt.io_gid != 0 {
+        //         Some(opt.io_gid)
+        //     } else {
+        //         None
+        //     };
+
+        //     (io_uid, io_gid)
+        // } else {
+        //     (None, None)
+        // };
+
+        // let opts = if from.has_options() {
+        //     // Try to unmarshal the 'options' field as an 'Options' struct
+        //     if let Ok(options) = from.take_options().unmarshal::<Options>() {
+        //         Some(options)
+        //     } else {
+        //         None
+        //     }
+        // } else {
+        //     None
+        // };
         Ok(Request::CreateContainer(ContainerConfig {
             container_id: from.id.clone(),
             bundle: from.bundle.clone(),
             rootfs_mounts: from.rootfs.iter().map(trans_from_shim_mount).collect(),
             terminal: from.terminal,
-            options,
+            options: None,
+            option,
             stdin: (!from.stdin.is_empty()).then(|| from.stdin.clone()),
             stdout: (!from.stdout.is_empty()).then(|| from.stdout.clone()),
             stderr: (!from.stderr.is_empty()).then(|| from.stderr.clone()),
