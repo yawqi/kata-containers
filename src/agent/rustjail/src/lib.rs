@@ -133,6 +133,8 @@ fn mount_grpc_to_oci(m: &grpc::Mount) -> oci::Mount {
         r#type: m.type_.clone(),
         source: m.source.clone(),
         options: m.options.clone(),
+        uid_mappings: idmaps_grpc_to_oci(&m.UIDMappings),
+        gid_mappings: idmaps_grpc_to_oci(&m.GIDMappings),
     }
 }
 

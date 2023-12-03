@@ -5,6 +5,7 @@
 //
 
 use anyhow::{anyhow, Result};
+use oci::LinuxIdMapping;
 use std::convert::TryFrom;
 
 use serde::{Deserialize, Serialize};
@@ -483,6 +484,10 @@ pub struct CreateSandboxRequest {
     pub sandbox_id: String,
     pub guest_hook_path: String,
     pub kernel_modules: Vec<KernelModule>,
+    pub shared_userns: bool,
+    pub shared_netns: bool,
+    pub uid_mappings: Vec<LinuxIdMapping>,
+    pub gid_mappings: Vec<LinuxIdMapping>,
 }
 
 #[derive(PartialEq, Clone, Default)]

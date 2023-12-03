@@ -171,6 +171,7 @@ pub fn init_rootfs(
     lazy_static::initialize(&PROPAGATION);
     lazy_static::initialize(&LINUXDEVICETYPE);
 
+    log_child!(cfd_log, "wqwqwqw init rootfs");
     let linux = &spec
         .linux
         .as_ref()
@@ -196,20 +197,26 @@ pub fn init_rootfs(
         .to_str()
         .ok_or_else(|| anyhow!("Could not convert rootfs path to string"))?;
 
-    mount(None::<&str>, "/", None::<&str>, flags, None::<&str>)?;
+    log_child!(cfd_log, "wqwqwqw init rootfs doing mount change rootfs mount options");
+    mount(None::<&str>, "/", None::<&str>, flags, None::<&str>)
+        .map_err(|e| anyhow!(e).context("wqwqwq change rootfs mount options failed"))?;
 
-    rootfs_parent_mount_private(rootfs)?;
+    log_child!(cfd_log, "wqwqwqw init rootfs doing rootfs_parent_mount_private");
+    rootfs_parent_mount_private(rootfs)
+        .map_err(|e| anyhow!(e).context("wqwqwq change rootfs mount parent private failed"))?;
 
+    log_child!(cfd_log, "wqwqwqw init rootfs doing mount bind mount rootfs");
     mount(
         Some(rootfs),
         rootfs,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    )?;
+    ).map_err(|e| anyhow!(e).context("wqwqwq rootfs bind mount failed"))?;
 
     let mut bind_mount_dev = false;
     for m in &spec.mounts {
+        log_child!(cfd_log, "wqwqwq mount: {:?}", m);
         let (mut flags, pgflags, data) = parse_mount(m);
         if !m.destination.starts_with('/') || m.destination.contains("..") {
             return Err(anyhow!(
@@ -247,7 +254,9 @@ pub fn init_rootfs(
                 }
             }
 
-            mount_from(cfd_log, m, rootfs, flags, &data, label)?;
+            log_child!(cfd_log, "wqwqwq mount_from");
+            mount_from(cfd_log, m, rootfs, flags, &data, label)
+                .map_err(|e | anyhow!(e).context("wqwqwq mount_from failed!"))?;
             // bind mount won't change mount options, we need remount to make mount options
             // effective.
             // first check that we have non-default options required before attempting a
@@ -265,19 +274,40 @@ pub fn init_rootfs(
         }
     }
 
+    log_child!(cfd_log, "wqwqwq chdir rootfs");
     let olddir = unistd::getcwd()?;
-    unistd::chdir(rootfs)?;
+    unistd::chdir(rootfs)
+        .map_err(|e| {
+            log_child!(cfd_log, "wqwqwq chdir failed {:?}", e);
+            anyhow!(e).context(format!("wqwqwq chdir failed, olddir: {:?}, rootfs: {:?}", olddir, rootfs))
+        })?;
 
     // in case the /dev directory was binded mount from guest,
     // then there's no need to create devices nodes and symlinks
     // in /dev.
     if !bind_mount_dev {
-        default_symlinks()?;
-        create_devices(&linux.devices, bind_device)?;
-        ensure_ptmx()?;
+        default_symlinks()
+            .map_err(|e| {
+                log_child!(cfd_log, "wqwqwq default_symlinks failed {:?}", e);
+                anyhow!(e).context("wqwqwq default_symlinks failed")
+            })?;
+        create_devices(&linux.devices, bind_device)
+            .map_err(|e| {
+                log_child!(cfd_log, "wqwqwq create_devices failed {:?}", e);
+                anyhow!(e).context(format!("wqwqwq create_devices failed, devices: {:?}, bind_device: {:?}", &linux.devices, bind_device))
+            })?;
+        ensure_ptmx()
+            .map_err(|e| {
+                log_child!(cfd_log, "wqwqwq ensure_ptmx failed {:?}", e);
+                anyhow!(e).context("wqwqwq ensure_ptmx failed")
+            })?;
     }
 
-    unistd::chdir(&olddir)?;
+    unistd::chdir(&olddir)
+        .map_err(|e| {
+            log_child!(cfd_log, "wqwqwq chdir2 failed {:?}", e);
+            anyhow!(e).context(format!("wqwqwq chdir2 failed, olddir: {:?}, rootfs: {:?}", olddir, rootfs))
+        })?;
 
     Ok(())
 }
@@ -344,7 +374,10 @@ fn mount_cgroups_v2(cfd_log: RawFd, m: &Mount, rootfs: &str, flags: MsFlags) -> 
         source: "cgroup".to_string(),
         r#type: "cgroup2".to_string(),
         destination: m.destination.clone(),
-        options: Vec::new(),
+        options: vec![],
+        // TODO r u sure?
+        uid_mappings: vec![],
+        gid_mappings: vec![],
     };
 
     let mount_flags: MsFlags = flags;
@@ -384,7 +417,10 @@ fn mount_cgroups(
         source: "tmpfs".to_string(),
         r#type: "tmpfs".to_string(),
         destination: m.destination.clone(),
-        options: Vec::new(),
+        options: vec![],
+        // TODO r u sure?
+        uid_mappings: vec![],
+        gid_mappings: vec![],
     };
 
     let cflags = MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
@@ -430,7 +466,10 @@ fn mount_cgroups(
             source: source.to_string(),
             r#type: "bind".to_string(),
             destination: destination.clone(),
-            options: Vec::new(),
+            options: vec![],
+            // TODO r u sure?
+            uid_mappings: vec![],
+            gid_mappings: vec![],
         };
 
         let mut mount_flags: MsFlags = flags | MsFlags::MS_REC | MsFlags::MS_BIND;
@@ -763,6 +802,30 @@ fn secure_join(rootfs: &str, unsafe_path: &str) -> String {
     path.to_str().unwrap().to_string()
 }
 
+/// To check if the current process is in a user namespace,
+/// assume that a process is in the init user namespace if and only if
+/// the contents of the uid_map file are `0 0 4294967295`.
+///
+/// Ref: https://github.com/opencontainers/runc/blob/main/libcontainer/userns/userns_linux.go
+pub fn run_in_userns() -> bool {
+    if let Ok(uid_mappings) = fs::read_to_string("/proc/self/uid_map") {
+        let lines: Vec<&str> = uid_mappings.split('\n').collect();
+
+        if lines.len() != 1 {
+            return true;
+        }
+
+        let parts: Vec<&str> = lines[0].split_whitespace().collect();
+        if parts.len() == 3 && parts[0] == "0" && parts[1] == "0" && parts[2] == "4294967295" {
+            return false;
+        }
+        return true;
+    }
+
+    // If the uid_map file doesn't exist, it means the kernel doesn't support user namespace.
+    false
+}
+
 fn mount_from(
     cfd_log: RawFd,
     m: &Mount,
@@ -819,6 +882,7 @@ fn mount_from(
         }
     };
 
+    log_child!(cfd_log, "wqwqwq mount_from doing stat");
     let _ = stat::stat(dest.as_str()).map_err(|e| {
         log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e);
         e
@@ -855,6 +919,7 @@ fn mount_from(
         }
     }
 
+    log_child!(cfd_log, "wqwqwq mount_from doing mount");
     mount(
         Some(src.as_str()),
         dest.as_str(),
@@ -862,9 +927,74 @@ fn mount_from(
         flags,
         Some(d.as_str()),
     )
+    .or_else(|e| {
+    //     // If in user namespace, direct mounting of the proc and sysfs file systems is not possible;
+    //     // instead, bind mount /proc and /sys.
+    //     // Ref: https://man7.org/linux/man-pages/man7/user_namespaces.7.html
+    //     if src == "proc" && run_in_userns() {
+    //         mount(
+    //             Some("/proc"),
+    //             dest.as_str(),
+    //             None::<&str>,
+    //             MsFlags::MS_BIND | MsFlags::MS_REC,
+    //             None::<&str>,
+    //         )
+    //         .map_err(|e| anyhow!("bind mount /proc failed: {:?}", e))?;
+    //         return Ok(());
+    //     }
+        if src == "sysfs" && run_in_userns() {
+            mount(
+                Some("/sys"),
+                dest.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(|e| anyhow!("bind mount /sys failed: {:?}", e))?;
+            return Ok(());
+        }
+    //     // if src == "tmpfs" && run_in_userns() {
+    //     //     mount(
+    //     //         Some("/dev"),
+    //     //         dest.as_str(),
+    //     //         None::<&str>,
+    //     //         MsFlags::MS_BIND | MsFlags::MS_REC,
+    //     //         None::<&str>,
+    //     //     )
+    //     //     .map_err(|e| anyhow!("bind mount /sys failed: {:?}", e))?;
+    //     //     return Ok(());
+    //     // }
+        if src == "mqueue" && run_in_userns() {
+            mount(
+                Some("/dev/mqueue"),
+                dest.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(|e| anyhow!("bind mount mqueue failed: {:?}", e))?;
+            return Ok(());
+        }
+        Err(anyhow!("mount {} to {} failed: {:?}", src.as_str(), dest.as_str(), e))
+    })
     .map_err(|e| {
-        log_child!(cfd_log, "mount error: {:?}", e);
-        e
+        log_child!(cfd_log,
+            "mount error: {:?}, src: {:?}, dst: {:?}, type: {:?}, flag: {:?}, data: {:?}",
+            e,
+            src.as_str(),
+            dest.as_str(),
+            m.r#type.as_str(),
+            flags,
+            d.as_str(),
+        );
+        anyhow!(e).context(format!(
+            "mount error: src: {:?}, dst: {:?}, type: {:?}, flag: {:?}, data: {:?}",
+            src.as_str(),
+            dest.as_str(),
+            m.r#type.as_str(),
+            flags,
+            d.as_str(),
+        ))
     })?;
 
     if !label.is_empty() && selinux::is_enabled()? && use_xattr {
@@ -881,6 +1011,7 @@ fn mount_from(
                 | MsFlags::MS_SLAVE),
         )
     {
+        log_child!(cfd_log, "wqwqwq mount_from doing remount");
         mount(
             Some(dest.as_str()),
             dest.as_str(),
@@ -1006,7 +1137,10 @@ fn bind_dev(dev: &LinuxDevice, relpath: &Path) -> Result<()> {
 pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<()> {
     let olddir = unistd::getcwd()?;
     log_child!(cfd_log, "old cwd: {}", olddir.to_str().unwrap());
-    unistd::chdir("/")?;
+    unistd::chdir("/")
+        .map_err(|e| {
+            anyhow!(e).context("wqwqwq chdir / failed")
+        })?;
 
     if !process.cwd.is_empty() {
         // Although the process.cwd string can be unclean/malicious (../../dev, etc),
@@ -1015,18 +1149,29 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<(
         log_child!(cfd_log, "Creating CWD {}", process.cwd.as_str());
         // Unconditionally try to create CWD, create_dir_all will not fail if
         // it already exists.
-        fs::create_dir_all(process.cwd.as_str())?;
+        fs::create_dir_all(process.cwd.as_str())
+            .map_err(|e| {
+                anyhow!(e).context("wqwqwq create_dir_all failed")
+            })?;
     }
 
     if spec.linux.is_some() {
         let linux = spec.linux.as_ref().unwrap();
 
+        log_child!(cfd_log, "wqwqwq linux masked path {:?}", linux.masked_paths);
         for path in linux.masked_paths.iter() {
-            mask_path(path)?;
+            mask_path(path)
+                .map_err(|e| {
+                    anyhow!(e).context(format!("wqwqwq mask_path failed: {:?}", path))
+                })?;
         }
 
+        log_child!(cfd_log, "wqwqwq linux readonly_paths {:?}", linux.readonly_paths);
         for path in linux.readonly_paths.iter() {
-            readonly_path(path)?;
+            readonly_path(path)
+                .map_err(|e| {
+                    anyhow!(e).context(format!("wqwqwq readonly_path failed: {:?}", path))
+                })?;
         }
     }
 
@@ -1040,7 +1185,9 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<(
                     None::<&str>,
                     flags | MsFlags::MS_REMOUNT,
                     None::<&str>,
-                )?;
+                ).map_err(|e| {
+                    anyhow!(e).context("wqwqwq mount /dev failed")
+                })?;
             }
         }
     }
@@ -1048,10 +1195,16 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<(
     if spec.root.as_ref().unwrap().readonly {
         let flags = MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_NODEV | MsFlags::MS_REMOUNT;
 
-        mount(Some("/"), "/", None::<&str>, flags, None::<&str>)?;
+        mount(Some("/"), "/", None::<&str>, flags, None::<&str>)
+            .map_err(|e| {
+                anyhow!(e).context("wqwqwq mount / / failed")
+            })?;
     }
     stat::umask(Mode::from_bits_truncate(0o022));
-    unistd::chdir(&olddir)?;
+    unistd::chdir(&olddir)
+        .map_err(|e| {
+            anyhow!(e).context("wqwqwq chdir failed")
+        })?;
 
     Ok(())
 }
@@ -1078,7 +1231,7 @@ fn readonly_path(path: &str) -> Result<()> {
     check_paths(path)?;
 
     if let Err(e) = mount(
-        Some(&path[1..]),
+        Some(&path[..]),
         path,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
@@ -1086,17 +1239,17 @@ fn readonly_path(path: &str) -> Result<()> {
     ) {
         match e {
             nix::Error::ENOENT => return Ok(()),
-            _ => return Err(e.into()),
+            _ => return Err(anyhow!("wqwqwqwq mount readonly failed: {:?}", e)),
         };
     }
-
+    // https://github.com/opencontainers/runc/pull/2897
     mount(
-        Some(&path[1..]),
-        &path[1..],
+        Some(&path[..]),
+        &path[..],
         None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
-    )?;
+    ).map_err(|e| anyhow!("wqwqwq remount readonly failed: {:?}", e))?;
 
     Ok(())
 }

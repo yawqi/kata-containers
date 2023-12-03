@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use libc::pid_t;
-use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
+use oci::{ContainerState, LinuxDevice};
 use oci::{Linux, LinuxNamespace, LinuxResources, Spec};
 use std::clone::Clone;
 use std::ffi::CString;
@@ -81,6 +81,8 @@ const FIFO_FD: &str = "FIFO_FD";
 const HOME_ENV_KEY: &str = "HOME";
 const PIDNS_FD: &str = "PIDNS_FD";
 const PIDNS_ENABLED: &str = "PIDNS_ENABLED";
+const USERNS_FD: &str = "USERNS_FD";
+const USERNS_ENABLED: &str = "USERNS_ENABLED";
 const CONSOLE_SOCKET_FD: &str = "CONSOLE_SOCKET_FD";
 
 #[derive(Debug)]
@@ -282,11 +284,11 @@ pub struct SyncPc {
 }
 
 #[derive(Debug, Clone)]
-pub struct PidNs {
+pub struct NsWithFd {
     enabled: bool,
     fd: Option<i32>,
 }
-impl PidNs {
+impl NsWithFd {
     pub fn new(enabled: bool, fd: Option<i32>) -> Self {
         Self { enabled, fd }
     }
@@ -351,13 +353,37 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     let crfd = std::env::var(CRFD_FD)?.parse::<i32>().unwrap();
     let cfd_log = std::env::var(CLOG_FD)?.parse::<i32>().unwrap();
 
+    // TODO we need to move this after we enter the user namespace
+    // TODO In cases that we need a new pid namespace,
+    // TODO we need to let the nuew user namespace to own the pid namespace.
+
+    if std::env::var(USERNS_ENABLED)?.eq(format!("{}", true).as_str()) {
+        // get the pidns fd from parent, if parent had passed the pidns fd,
+        // then get it and join in this pidns; otherwise, create a new pidns
+        // by unshare from the parent pidns.
+        match std::env::var(USERNS_FD) {
+            Ok(fd) => {
+                let userns_fd = fd.parse::<i32>().context("get userns fd from parent")?;
+                sched::setns(userns_fd, CloneFlags::CLONE_NEWUSER).context("failed to join userns")?;
+                let _ = unistd::close(userns_fd);
+            }
+            Err(e) => {
+                return Err(anyhow!(format!(
+                    "The userns cannot be enabled without providing an existing shared userns fd: {:?}",
+                    e
+                )));
+            }
+        }
+        setid(Uid::from_raw(0), Gid::from_raw(0))?;
+    }
+
     if std::env::var(PIDNS_ENABLED)?.eq(format!("{}", true).as_str()) {
         // get the pidns fd from parent, if parent had passed the pidns fd,
         // then get it and join in this pidns; otherwise, create a new pidns
         // by unshare from the parent pidns.
         match std::env::var(PIDNS_FD) {
             Ok(fd) => {
-                let pidns_fd = fd.parse::<i32>().context("get parent pidns fd")?;
+                let pidns_fd = fd.parse::<i32>().context("get pidns fd from parent")?;
                 sched::setns(pidns_fd, CloneFlags::CLONE_NEWPID).context("failed to join pidns")?;
                 let _ = unistd::close(pidns_fd);
             }
@@ -367,6 +393,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         }
     }
 
+    // TODO add mount open tree here
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {
             log_child!(
@@ -429,10 +456,11 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     // get namespace vector to join/new
     let nses = get_namespaces(linux);
 
-    let mut userns = false;
+    // let mut userns = false;
     let mut to_new = CloneFlags::empty();
     let mut to_join = Vec::new();
 
+    let mut bind_device = false;
     for ns in &nses {
         let s = NAMESPACES.get(&ns.r#type.as_str());
         if s.is_none() {
@@ -440,8 +468,12 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
         }
         let s = s.unwrap();
 
+        log_child!(cfd_log, "wqwqwq namespace: {:?}", ns);
         if ns.path.is_empty() {
             // skip the pidns since it has been done in parent process.
+            if *s == CloneFlags::CLONE_NEWUSER {
+                return Err(anyhow!("User namespace should be pod or node level, container level is not support!"));
+            }
             if *s != CloneFlags::CLONE_NEWPID {
                 to_new.set(*s, true);
             }
@@ -457,15 +489,13 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
                     log_child!(cfd_log, "error is : {:?}", e);
                     e
                 })?;
-
-            if *s != CloneFlags::CLONE_NEWPID {
+            if *s == CloneFlags::CLONE_NEWUSER {
+                bind_device = true;
+            }
+            if *s != CloneFlags::CLONE_NEWPID && *s != CloneFlags::CLONE_NEWUSER {
                 to_join.push((*s, fd));
             }
         }
-    }
-
-    if to_new.contains(CloneFlags::CLONE_NEWUSER) {
-        userns = true;
     }
 
     if p.oom_score_adj.is_some() {
@@ -498,30 +528,7 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     //
     // Ref: https://github.com/opencontainers/runc/commit/50a19c6ff828c58e5dab13830bd3dacde268afe5
     //
-    if !nses.is_empty() {
-        capctl::prctl::set_dumpable(false)
-            .map_err(|e| anyhow!(e).context("set process non-dumpable failed"))?;
-    }
-
-    if userns {
-        log_child!(cfd_log, "enter new user namespace");
-        sched::unshare(CloneFlags::CLONE_NEWUSER)?;
-    }
-
-    log_child!(cfd_log, "notify parent unshare user ns completed");
-    // notify parent unshare user ns completed.
-    write_sync(cwfd, SYNC_SUCCESS, "")?;
-    // wait parent to setup user id mapping.
-    log_child!(cfd_log, "wait parent to setup user id mapping");
-    read_sync(crfd)?;
-
-    if userns {
-        log_child!(cfd_log, "setup user id");
-        setid(Uid::from_raw(0), Gid::from_raw(0))?;
-    }
-
     let mut mount_fd = -1;
-    let mut bind_device = false;
     for (s, fd) in to_join {
         if s == CloneFlags::CLONE_NEWNS {
             mount_fd = fd;
@@ -530,42 +537,68 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
         log_child!(cfd_log, "join namespace {:?}", s);
         sched::setns(fd, s).or_else(|e| {
-            if s == CloneFlags::CLONE_NEWUSER {
-                if e != Errno::EINVAL {
-                    let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
-                    return Err(e);
-                }
-
-                Ok(())
-            } else {
-                let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
-                Err(e)
-            }
+            log_child!(cfd_log, "wqwqwq join namespace {:?} failed {:?}!!!!!", s, e);
+            let _ = write_sync(cwfd, SYNC_FAILED, format!("{:?}", e).as_str());
+            Err(e)
         })?;
 
         unistd::close(fd)?;
 
-        if s == CloneFlags::CLONE_NEWUSER {
-            setid(Uid::from_raw(0), Gid::from_raw(0))?;
-            bind_device = true;
-        }
+        // if s == CloneFlags::CLONE_NEWUSER {
+        //     setid(Uid::from_raw(0), Gid::from_raw(0))?;
+        //     bind_device = true;
+        // }
     }
+
+    // if !nses.is_empty() {
+    //     capctl::prctl::set_dumpable(true)
+    //         .map_err(|e| anyhow!(e).context("set process dumpable failed"))?;
+    // }
+
+    log_child!(cfd_log, "notify parent enter user ns completed");
+    // notify parent unshare user ns completed.
+    write_sync(cwfd, SYNC_SUCCESS, "")?;
+    // // wait parent to setup user id mapping.
+    // log_child!(cfd_log, "wait parent to setup user id mapping");
+    read_sync(crfd)?;
+
+    // if !nses.is_empty() {
+    //     capctl::prctl::set_dumpable(false)
+    //         .map_err(|e| anyhow!(e).context("set process non-dumpable failed"))?;
+    // }
 
     let selinux_enabled = selinux::is_enabled()?;
 
     sched::unshare(to_new & !CloneFlags::CLONE_NEWUSER)?;
 
-    if userns {
-        bind_device = true;
-    }
-
     if to_new.contains(CloneFlags::CLONE_NEWUTS) {
         unistd::sethostname(&spec.hostname)?;
     }
 
+    // match unsafe { fork() } {
+    //     Ok(ForkResult::Parent { child, .. }) => {
+    //         log_child!(
+    //             cfd_log,
+    //             "Continuing execution in temporary process, new grandchild has pid: {:?}",
+    //             child
+    //         );
+    //         let _ = write_sync(cwfd, SYNC_DATA, format!("{}", pid_t::from(child)).as_str());
+    //         // parent return
+    //         return Ok(());
+    //     }
+    //     Ok(ForkResult::Child) => (),
+    //     Err(e) => {
+    //         return Err(anyhow!(format!(
+    //             "failed to fork temporary process: {:?}",
+    //             e
+    //         )));
+    //     }
+    // }
+
     let rootfs = spec.root.as_ref().unwrap().path.as_str();
     log_child!(cfd_log, "setup rootfs {}", rootfs);
-    let root = fs::canonicalize(rootfs)?;
+    let root = fs::canonicalize(rootfs)
+        .map_err(|e| anyhow!(e).context(format!("setup rootfs failed {:?}", rootfs)))?;
     let rootfs = root.to_str().unwrap();
 
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
@@ -599,19 +632,32 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
     if to_new.contains(CloneFlags::CLONE_NEWNS) {
         // unistd::chroot(rootfs)?;
         if no_pivot {
-            mount::ms_move_root(rootfs)?;
+            mount::ms_move_root(rootfs)
+                .map_err(|e| {
+                    anyhow!(e).context("wqwqwq ms_move_root failed")
+                })?;
         } else {
             // pivot root
-            mount::pivot_rootfs(rootfs)?;
+            mount::pivot_rootfs(rootfs)
+                .map_err(|e| {
+                    anyhow!(e).context("wqwqwq pivot_rootfs failed")
+                })?;
         }
 
         // setup sysctl
-        set_sysctls(&linux.sysctl)?;
-        unistd::chdir("/")?;
-    }
+        set_sysctls(&linux.sysctl)
+            .map_err(|e| {
+                anyhow!(e).context(format!("wqwqwq set_sysctls failed {:?}", &linux.sysctl))
+            })?;
+        unistd::chdir("/")
+            .map_err(|e| {
+                anyhow!(e).context("wqwqwq chdir / failed")
+            })?;
 
-    if to_new.contains(CloneFlags::CLONE_NEWNS) {
-        mount::finish_rootfs(cfd_log, &spec, &oci_process)?;
+        mount::finish_rootfs(cfd_log, &spec, &oci_process)
+            .map_err(|e| {
+                anyhow!(e).context("wqwqwq finish_rootfs failed")
+            })?;
     }
 
     if !oci_process.cwd.is_empty() {
@@ -998,7 +1044,8 @@ impl BaseContainer for LinuxContainer {
             child_stderr = unsafe { std::process::Stdio::from_raw_fd(stderr) };
         }
 
-        let pidns = get_pid_namespace(&self.logger, linux)?;
+        let pidns = get_namespace_with_fd(&self.logger, "pid".to_owned(), linux)?;
+        let userns = get_namespace_with_fd(&self.logger, "user".to_owned(), linux)?;
         #[cfg(not(feature = "standard-oci-runtime"))]
         if !pidns.enabled {
             return Err(anyhow!("cannot find the pid ns"));
@@ -1029,7 +1076,8 @@ impl BaseContainer for LinuxContainer {
             .env(CWFD_FD, format!("{}", cwfd))
             .env(CLOG_FD, format!("{}", cfd_log))
             .env(CONSOLE_SOCKET_FD, console_name)
-            .env(PIDNS_ENABLED, format!("{}", pidns.enabled));
+            .env(PIDNS_ENABLED, format!("{}", pidns.enabled))
+            .env(USERNS_ENABLED, format!("{}", userns.enabled));
 
         if p.init {
             child = child.env(FIFO_FD, format!("{}", fifofd));
@@ -1037,6 +1085,11 @@ impl BaseContainer for LinuxContainer {
 
         if pidns.fd.is_some() {
             child = child.env(PIDNS_FD, format!("{}", pidns.fd.unwrap()));
+        }
+        if userns.fd.is_some() {
+            child = child.env(USERNS_FD, format!("{}", userns.fd.unwrap()));
+        } else {
+            return Err(anyhow!("Userns must be node or pod level, container level not supported!"));
         }
 
         child.spawn()?;
@@ -1057,14 +1110,10 @@ impl BaseContainer for LinuxContainer {
                 )));
             }
         };
-
         p.pid = pid;
 
         if p.init {
             self.init_process_pid = p.pid;
-        }
-
-        if p.init {
             let _ = unistd::close(fifofd).map_err(|e| warn!(logger, "close fifofd {:?}", e));
         }
 
@@ -1091,6 +1140,10 @@ impl BaseContainer for LinuxContainer {
 
             e
         })?;
+
+        // if p.init {
+        //     self.init_process_pid = p.pid;
+        // }
 
         info!(logger, "entered namespaces!");
 
@@ -1270,11 +1323,11 @@ pub fn update_namespaces(logger: &Logger, spec: &mut Spec, init_pid: RawFd) -> R
     Ok(())
 }
 
-fn get_pid_namespace(logger: &Logger, linux: &Linux) -> Result<PidNs> {
+fn get_namespace_with_fd(logger: &Logger, nstype: String, linux: &Linux) -> Result<NsWithFd> {
     for ns in &linux.namespaces {
-        if ns.r#type == "pid" {
+        if ns.r#type == nstype {
             if ns.path.is_empty() {
-                return Ok(PidNs::new(true, None));
+                return Ok(NsWithFd::new(true, None));
             }
 
             let fd =
@@ -1290,19 +1343,19 @@ fn get_pid_namespace(logger: &Logger, linux: &Linux) -> Result<PidNs> {
                     e
                 })?;
 
-            return Ok(PidNs::new(true, Some(fd)));
+            return Ok(NsWithFd::new(true, Some(fd)));
         }
     }
 
-    Ok(PidNs::new(false, None))
+    Ok(NsWithFd::new(false, None))
 }
 
-fn is_userns_enabled(linux: &Linux) -> bool {
-    linux
-        .namespaces
-        .iter()
-        .any(|ns| ns.r#type == "user" && ns.path.is_empty())
-}
+// fn is_userns_enabled(linux: &Linux) -> bool {
+//     linux
+//         .namespaces
+//         .iter()
+//         .any(|ns| ns.r#type == "user" && ns.path.is_empty())
+// }
 
 fn get_namespaces(linux: &Linux) -> Vec<LinuxNamespace> {
     linux
@@ -1355,7 +1408,7 @@ async fn join_namespaces(
     let linux = spec.linux.as_ref().unwrap();
     let res = linux.resources.as_ref();
 
-    let userns = is_userns_enabled(linux);
+    // let userns = is_userns_enabled(linux);
 
     info!(logger, "try to send spec from parent to child");
     let spec_str = serde_json::to_string(spec)?;
@@ -1389,21 +1442,6 @@ async fn join_namespaces(
     info!(logger, "wait child setup user namespace");
     read_async(pipe_r).await?;
 
-    if userns {
-        info!(logger, "setup uid/gid mappings");
-        // setup uid/gid mappings
-        write_mappings(
-            &logger,
-            &format!("/proc/{}/uid_map", p.pid),
-            &linux.uid_mappings,
-        )?;
-        write_mappings(
-            &logger,
-            &format!("/proc/{}/gid_map", p.pid),
-            &linux.gid_mappings,
-        )?;
-    }
-
     // apply cgroups
     // For FsManger, it's no matter about the order of apply and set.
     // For SystemdManger, apply must be precede set because we can only create a systemd unit with specific processes(pids).
@@ -1420,6 +1458,22 @@ async fn join_namespaces(
     info!(logger, "notify child to continue");
     // notify child to continue
     write_async(pipe_w, SYNC_SUCCESS, "").await?;
+
+    // info!(logger, "wait child to fork grandchild");
+    // let pid_buf = read_async(pipe_r).await?;
+    // let pid_str = std::str::from_utf8(&pid_buf).context("get pid string")?;
+    // let pid = match pid_str.parse::<i32>() {
+    //     Ok(i) => i,
+    //     Err(e) => {
+    //         return Err(anyhow!(format!(
+    //             "failed to get container process's pid: {:?}",
+    //             e
+    //         )));
+    //     }
+    // };
+    // p.pid = pid;
+
+    // info!(logger, "grandchild pid: {}", p.pid);
 
     if p.init {
         info!(logger, "notify child parent ready to run prestart hook!");
@@ -1445,26 +1499,6 @@ async fn join_namespaces(
     info!(logger, "wait for child process ready to run exec");
     read_async(pipe_r).await?;
 
-    Ok(())
-}
-
-fn write_mappings(logger: &Logger, path: &str, maps: &[LinuxIdMapping]) -> Result<()> {
-    let data = maps
-        .iter()
-        .filter(|m| m.size != 0)
-        .map(|m| format!("{} {} {}\n", m.container_id, m.host_id, m.size))
-        .collect::<Vec<_>>()
-        .join("");
-
-    info!(logger, "mapping: {}", data);
-    if !data.is_empty() {
-        let fd = fcntl::open(path, OFlag::O_WRONLY, Mode::empty())?;
-        defer!(unistd::close(fd).unwrap());
-        unistd::write(fd, data.as_bytes()).map_err(|e| {
-            info!(logger, "cannot write mapping");
-            e
-        })?;
-    }
     Ok(())
 }
 
