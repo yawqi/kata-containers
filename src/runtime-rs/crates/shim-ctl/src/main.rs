@@ -24,6 +24,7 @@ async fn real_main() {
         rootfs_mounts: Vec::new(),
         terminal: false,
         options: None,
+        option: None,
         stdin: None,
         stdout: None,
         stderr: None,

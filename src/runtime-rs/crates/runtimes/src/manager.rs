@@ -185,6 +185,13 @@ impl RuntimeHandlerManagerInner {
                     }
                     // if we get empty netns from oci spec, we need to create netns for the VM
                     else {
+                        // If userns is enabled and host netns is disabled, the containerd will leave the nspath empty.
+                        // We should create our own netns after userns has been created.
+                        // To be noted, this is only the netns on the host used by vmm.
+                        // In the guest, we still need to create a netns owned by the userns if hostUser is False.
+
+                        // TODO the netns name here is randomly generated
+                        // However, containerd will try to persist the netns with the /proc/$pid/netns path to /var/run/netns/$(randmon_generated)
                         let ns_name = generate_netns_name();
                         let netns = NetNs::new(ns_name)?;
                         let path = PathBuf::from(netns.path()).to_str().map(|s| s.to_string());
